@@ -1,0 +1,684 @@
+---
+title: "Titanic Dataset EDA and Modeling"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Introduction
+
+Given a dataset of attributes for passengers on the Titanic, we will attempt to model and predict whether or not each passenger survived the sinking. After some data preprocessing, we perform an exploratory data analysis and model the data using a variety of algorithms. We combine the best trained models for each algorithm and combine their predictions on the test set. We produce two submission files ready for [Kaggle](https://www.kaggle.com/c/titanic), producing a score within the top 22% percent of participants.
+
+First we load our libraries and our data. Make sure your current working directory is set to the root directory of this repo.
+
+```{r}
+library(tidyverse)
+library(caTools)
+library(pROC)
+library(class)
+library(randomForest)
+library(gbm)
+library(e1071)
+library(MASS)
+
+# Data import and preprocessing
+# Load data (make sure your current working directory is set to this repo's root)
+df_train = read_csv('data/train.csv')
+df_test = read_csv('data/test.csv')
+```
+
+
+Let's identify which variables contains NAs in the training set and the test set, and save these for later.
+
+```{r}
+# Variables in df_train with NAs: Age, Cabin, Embarked
+var_has_NAs_train <- df_train %>% apply(2, is.na) %>% apply(2, any)
+vars_with_NAs_train <- names(var_has_NAs_train[var_has_NAs_train])
+print(vars_with_NAs_train)
+
+# Variables in df_test with NAs: Age, Cabin, Fare
+var_has_NAs_test <- df_test %>% apply(2, is.na) %>% apply(2, any)
+vars_with_NAs_test <- names(var_has_NAs_test[var_has_NAs_test])
+print(vars_with_NAs_test)
+```
+
+
+We'll need to convert the variables we know to be categorical from numeric or character data types to factors.
+
+```{r}
+# Convert categorical data to factors
+df_train$Survived <- df_train$Survived > 0
+df_train$Sex <- factor(df_train$Sex)
+df_train$Pclass <- factor(df_train$Pclass)
+df_train$Embarked <- factor(df_train$Embarked)
+```
+
+
+Now we compute some new features that may or may not be useful. Our visualizations will tell us which is the case.
+
+```{r}
+# New features. We will visualize these to see if any of them are promising.
+df_train$AgeIsNA <- is.na(df_train$Age)
+df_train$Young <- df_train$Age < 18 & !is.na(df_train$Age)
+
+df_train$CabinIsNA <- is.na(df_train$Cabin)
+
+df_train$OneSibSp <- df_train$SibSp == 1
+df_train$NonzeroSibSp <- df_train$SibSp > 0
+df_train$OneOrTwoSibSp <- df_train$SibSp == 1 | df_train$SibSp == 2
+df_train$ManySiblings <- df_train$SibSp > 2
+
+df_train$OneOrTwoParch <- df_train$Parch == 1 | df_train$Parch == 2
+df_train$OneTwoOrThreeParch <- df_train$Parch == 1 | df_train$Parch == 2 | df_train$Parch == 3
+df_train$NonzeroParch <- df_train$Parch > 0
+df_train$ManyChildren <- df_train$Parch > 3  # Can't have more than 2 parents, so the rest must be children
+
+df_train$TicketIsNumeric <- df_train$Ticket %>% as.numeric() %>% is.na() %>% !.
+median_ticket_number <- df_train$Ticket %>% as.numeric() %>% median(na.rm = TRUE)
+df_train$TicketNumberAboveMedian <- df_train$Ticket > median_ticket_number
+```
+
+## Exploratory data analysis
+
+We're ready to begin our exploratory data analysis. We'll explore any relationships that might seem interesting, and undoubtedly many will lead to dead ends.
+
+First we see that `Pclass` and `Sex` seem highly correlated with survival, `Age` seems slightly correlated, and `Fare` seems uncorrelated.
+
+```{r}
+ggplot(df_train, aes(Age, Fare)) + geom_point(aes(color = factor(Survived))) + facet_grid(Pclass ~ Sex)
+```
+
+
+`Fare` and `Pclass` seem highly correlated, as expected.
+
+```{r}
+ggplot(df_train) + stat_summary(aes(Pclass, Fare), fun.min = min, fun.max = max, fun = median)
+```
+
+
+Almost no first class passengers embarked at `Q`. Most passengers embarked at `S`. Intuitively, place of embarkment probably has nothing to do with survival, so we will ignore it for now. You may want to question this later.
+
+```{r}
+ggplot(df_train, aes(Embarked, Fare, color = Pclass)) + geom_jitter()
+ggplot(df_train, aes(Embarked, Fare, color = Survived)) + geom_jitter()
+ggplot(df_train, aes(Embarked, fill = Survived)) + geom_bar()
+ggplot(df_train, aes(Embarked, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+There are almost twice as many male passengers as female passengers.
+
+```{r}
+ggplot(df_train, aes(Sex)) + geom_bar()
+```
+
+
+A much higher percentage of women than men survived.
+
+```{r}
+ggplot(df_train, aes(Sex, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+Order of decreasing survival rate per `Embarked` factor level: `C > Q > S`.
+
+```{r}
+ggplot(df_train, aes(Embarked, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+The higher the class number, the lower the chance of survival.
+
+```{r}
+ggplot(df_train, aes(Pclass, fill = Survived)) + geom_bar(position = "fill")
+
+```
+
+
+There's a slightly lower chance of survival if `Age` is `NA`.
+
+```{r}
+ggplot(df_train, aes(AgeIsNA, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+There's a much lower chance of survival if `Cabin` is `NA`.
+
+```{r}
+ggplot(df_train, aes(CabinIsNA, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+It seems there isn't much of a relationship between `Sex` and `Fare`.
+
+```{r}
+ggplot(df_train) + stat_summary(aes(Sex, Fare), fun.min = min, fun.max = max, fun = median)
+```
+
+
+The median ages for men and women are about the same, but there are men much older than the oldest woman.
+
+```{r}
+ggplot(df_train) + stat_summary(aes(Sex, Age), fun.min = min, fun.max = max, fun = median)
+```
+
+
+No apparent relationship between one's ticket being numeric and survival.
+
+```{r}
+ggplot(df_train, aes(TicketIsNumeric, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+There's a slightly higher chance of survival if `SibSp == 1` or `SibSp == 2`. Beware of low counts in classes -- we need to consider both counts and proportions.
+
+```{r}
+## Counts
+ggplot(df_train, aes(SibSp, fill = Survived)) + geom_bar()
+ggplot(df_train, aes(OneSibSp, fill = Survived)) + geom_bar()
+ggplot(df_train, aes(OneOrTwoSibSp, fill = Survived)) + geom_bar()
+## Proportions
+ggplot(df_train, aes(SibSp, fill = Survived)) + geom_bar(position = "fill")
+ggplot(df_train, aes(OneSibSp, fill = Survived)) + geom_bar(position = "fill")
+ggplot(df_train, aes(OneOrTwoSibSp, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+Chance of survival is slightly greater if `Parch == 1`, `Parch == 2` or `Parch == 3`.
+
+```{r}
+## Counts
+ggplot(df_train, aes(Parch, fill = Survived)) + geom_bar()
+ggplot(df_train, aes(OneOrTwoParch, fill = Survived)) + geom_bar()
+ggplot(df_train, aes(OneTwoOrThreeParch, fill = Survived)) + geom_bar()
+## Proportions
+ggplot(df_train, aes(Parch, fill = Survived)) + geom_bar(position = "fill")
+ggplot(df_train, aes(OneOrTwoParch, fill = Survived)) + geom_bar(position = "fill")
+ggplot(df_train, aes(OneTwoOrThreeParch, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+Much higher fares on average if `OneOrTwoParch == TRUE`.
+
+```{r}
+ggplot(df_train, aes(OneOrTwoParch, Fare, color = Survived)) + geom_jitter()
+df_train %>% group_by(OneOrTwoParch) %>% summarize(MeanFare = mean(Fare)) %>% print()
+```
+
+
+Interestingly, there's a much higher chance of survival if one's ticket number is above the median number.
+
+```{r}
+ggplot(df_train, aes(TicketNumberAboveMedian, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+The young (age under 18) have a higher chance of survival.
+
+```{r}
+ggplot(df_train, aes(Young, fill = Survived)) + geom_bar(position = "fill")
+```
+
+
+The relationship between `SibSp` and `Parch` shows that high values for either variable correspond to low survival.
+
+```{r}
+ggplot(df_train, aes(Parch, SibSp)) + geom_jitter(aes(color = Survived))
+```
+
+
+Based on these visualizations, we will store variables that seem promising in `candidate_vars`. We will try all combinations of variables from `candidate_vars` in our models to find the best combination for each algorithm.
+
+```{r}
+candidate_vars <- c("Sex", 
+                    "Pclass", 
+                    "AgeIsNA", 
+                    "CabinIsNA", 
+                    "OneOrTwoSibSp", 
+                    "OneTwoOrThreeParch", 
+                    "TicketNumberAboveMedian", 
+                    "Young", 
+                    "ManyChildren", 
+                    "ManySiblings")
+```
+
+
+## Modeling
+
+We'll iterate through all possible combinations of variables in `candidate_vars` and train each of the following modeling algorithms: logistic regression, K nearest neighbors, random forests, gradient boosting machine, support vector machine, linear discriminant analysis, and naive Bayes.
+
+First we split our training data for five-fold cross validation.
+
+```{r}
+# Generate folds for cross validation
+df_train_splits <- list()
+df_val_splits <- list()
+num_folds <- 5
+
+set.seed(1)
+for (fold_index in seq(num_folds)) {
+  sample_indices <- sample.split(df_train$PassengerId, SplitRatio = 1 / num_folds)
+  df_train_split <- subset(df_train, sample_indices == FALSE)
+  df_val_split <- subset(df_train, sample_indices == TRUE)
+  df_train_splits[[fold_index]] <- df_train_split
+  df_val_splits[[fold_index]] <- df_val_split
+}
+```
+
+
+We'll need to preprocess variables and add new features for the test set, just as we did for the training set earlier.
+
+```{r}
+df_test$Sex <- factor(df_test$Sex)
+df_test$Pclass <- factor(df_test$Pclass)
+df_test$AgeIsNA <- is.na(df_test$Age)
+df_test$CabinIsNA <- is.na(df_test$Cabin)
+df_test$OneOrTwoSibSp <- df_test$SibSp == 1 | df_test$SibSp == 2
+df_test$OneTwoOrThreeParch <- df_test$Parch == 1 | df_test$Parch == 2 | df_test$Parch == 3
+df_test$TicketNumberAboveMedian <- df_test$Ticket > median_ticket_number
+df_test$Young <- df_test$Age < 18 & !is.na(df_test$Age)
+df_test$ManyChildren <- df_test$Parch > 3
+df_test$ManySiblings <- df_test$SibSp > 2
+```
+
+
+We define a helper function to convert formulas to a vector of variable names. We'll be using this often.
+
+```{r}
+extractVariablesFromFormula <- function(formula) {
+  return(unlist(strsplit(strsplit(as.character(list(formula)), " ~ ", fixed = TRUE)[[1]][2], " + ", fixed = TRUE)))
+}
+```
+
+
+Now we begin training. For each algorithm, we'll iterate through all combinations of `candidate_vars`, and occasionally we'll iterate through some algorithm-specific hyperparameters as well. We'll extract the best model, along with its formula, prediction rate (which we'll print), and any hyperparameter values. We'll compute predictions for the test set using each algorithm's best model along the way. Note that we could've combined all the algorithms into one big loop, but the hyperparameters and syntax for the various algorithms are different enough to make such a loop very unwieldy. It's much clearer to split them up like this.
+
+Note that training may take a few minutes for each algorithm.
+
+### Logistic regression (generalized linear model)
+
+```{r}
+formula_list <- list()
+prediction_rate_list <- list()
+mean_threshold_list <- list()
+formula_index <- 1
+
+for (num_vars in seq(length(candidate_vars))) {
+  vars_combos <- combn(candidate_vars, num_vars)
+  for (combo_idx in seq(ncol(vars_combos))) {
+    formula <- as.formula(paste("Survived", paste(vars_combos[,combo_idx], collapse = " + "), sep = "~"))
+    prediction_rate <- list()
+    threshold_list <- list()
+    for (fold_index in seq(num_folds)) {
+      df_train_split <- df_train_splits[[fold_index]]
+      df_val_split <- df_val_splits[[fold_index]]
+      model_binomial <- glm(formula, df_train_split, family = "binomial")
+      probabilities <- predict(model_binomial, df_val_split, type = "response")
+      roc_obj <- roc(df_val_split$Survived, probabilities, quiet = TRUE)
+      threshold <- coords(roc_obj, "best", "threshold", transpose = FALSE)$threshold
+      if (all(is.finite(threshold))) {
+        threshold_list[[fold_index]] <- threshold
+        predictions <- probabilities > threshold
+        prediction_rate[[fold_index]] <- mean(predictions == df_val_split$Survived)
+      } else {
+        threshold_list[[fold_index]] <- NA
+        prediction_rate[[fold_index]] <- NA
+      }
+    }
+    formula_list[[formula_index]] <- formula
+    prediction_rate_list[[formula_index]] <- mean(as.numeric(prediction_rate), na.rm = TRUE)
+    mean_threshold_list[[formula_index]] <- mean(as.numeric(threshold_list), na.rm = TRUE)
+    formula_index <- formula_index + 1
+  }
+}
+
+# Train on full training set and compute predictions for test set
+best_glm_formula <- formula_list[[which.max(unlist(prediction_rate_list))]]
+best_glm_prediction_rate <- max(unlist(prediction_rate_list))
+glm_threshold <- mean_threshold_list[[which.max(unlist(prediction_rate_list))]]
+print(str_c("Best Generalized Linear Model prediction rate: ", best_glm_prediction_rate))
+
+best_model_glm <- glm(best_glm_formula, df_train, family = "binomial")
+glm_probabilities <- predict(best_model_glm, df_test, type = "response")
+glm_predictions <- as.numeric(glm_probabilities > glm_threshold)
+```
+
+
+### K nearest neighbors
+
+```{r}
+best_formula_list <- list()
+best_prediction_rate_list <- list()
+k_candidates <- c(1, 3, 5, 10, 20, 50)
+
+for (k in k_candidates) {
+  formula_list <- list()
+  prediction_rate_list <- list()
+  formula_index <- 1
+  for (num_vars in seq(length(candidate_vars))) {
+    vars_combos <- combn(candidate_vars, num_vars)
+    for (combo_idx in seq(ncol(vars_combos))) {
+      formula <- as.formula(paste("Survived", paste(vars_combos[,combo_idx], collapse = " + "), sep = "~"))
+      prediction_rate <- list()
+      for (fold_index in seq(num_folds)) {
+        df_train_split <- dplyr::select(df_train_splits[[fold_index]], vars_combos[,combo_idx]) %>% sapply(as.numeric) %>% scale() %>% as.data.frame()
+        df_val_split <- dplyr::select(df_val_splits[[fold_index]], vars_combos[,combo_idx]) %>% sapply(as.numeric) %>% scale() %>% as.data.frame()
+        predictions <- knn(df_train_split, df_val_split, df_train_splits[[fold_index]]$Survived, k = k)
+        prediction_rate[[fold_index]] <- mean(predictions == df_val_splits[[fold_index]]$Survived)
+      }
+      formula_list[[formula_index]] <- formula
+      prediction_rate_list[[formula_index]] <- mean(as.numeric(prediction_rate))
+      formula_index <- formula_index + 1
+    }
+  }
+  best_formula_list <- append(best_formula_list, formula_list[which.max(unlist(prediction_rate_list))])
+  best_prediction_rate_list <- append(best_prediction_rate_list, max(unlist(prediction_rate_list)))
+}
+
+# Train on full training set and compute predictions for test set
+# Choose the best k value for KNN
+best_k <- k_candidates[[which.max(best_prediction_rate_list)]]
+best_knn_formula <- best_formula_list[[which.max(unlist(best_prediction_rate_list))]]
+best_knn_vars <- extractVariablesFromFormula(best_knn_formula)
+best_knn_prediction_rate <- max(unlist(best_prediction_rate_list))
+print(str_c("Best K Nearest Neighbors prediction rate: ", best_knn_prediction_rate))
+
+df_train_knn <- dplyr::select(df_train, all_of(best_knn_vars)) %>% sapply(as.numeric) %>% scale() %>% as.data.frame()
+df_test_knn <- dplyr::select(df_test, all_of(best_knn_vars)) %>% sapply(as.numeric) %>% scale() %>% as.data.frame()
+knn_predictions <- as.numeric(as.logical(knn(df_train_knn, df_test_knn, df_train$Survived, k = best_k)))
+```
+
+
+### Random forest without class weights
+
+```{r}
+formula_list <- list()
+prediction_rate_list <- list()
+formula_index <- 1
+
+for (num_vars in seq(length(candidate_vars))) {
+  vars_combos <- combn(candidate_vars, num_vars)
+  for (combo_idx in seq(ncol(vars_combos))) {
+    prediction_rate <- list()
+    for (fold_index in seq(num_folds)) {
+      df_train_split <- df_train_splits[[fold_index]]
+      df_train_split$Survived <- factor(df_train_split$Survived)  # without this line, randomForest() will perform regression instead of classification
+      df_val_split <- df_val_splits[[fold_index]]
+      formula <- as.formula(paste("Survived", paste(vars_combos[,combo_idx], collapse = " + "), sep = "~"))
+      model_random_forest <- randomForest(formula, data = df_train_split, importance = TRUE)
+      predictions <- predict(model_random_forest, df_val_split, type = "class")
+      prediction_rate[[fold_index]] <- mean(predictions == df_val_split$Survived)
+    }
+    formula_list[[formula_index]] <- formula
+    prediction_rate_list[[formula_index]] <- mean(as.numeric(prediction_rate))
+    formula_index <- formula_index + 1
+  }
+}
+
+# Train on full training set and compute predictions for test set
+best_rf_formula <- formula_list[[which.max(unlist(prediction_rate_list))]]
+best_rf_prediction_rate <- max(unlist(prediction_rate_list))
+print(str_c("Best Random Forest prediction rate: ", best_rf_prediction_rate))
+
+df_train_rf <- df_train
+df_train_rf$Survived <- factor(df_train_rf$Survived)  # without this line, randomForest() will perform regression instead of classification
+best_model_rf <- randomForest(best_rf_formula, df_train_rf)
+rf_predictions <- as.numeric(as.logical(predict(best_model_rf, df_test)))
+```
+
+
+### Random forest with class weights
+
+```{r}
+# Compute class weights for more balanced training
+passenger_count <- count(df_train)$n
+survivor_count <- df_train$Survived %>% as.numeric() %>% sum()
+class_weights <- c(passenger_count / (2 * (passenger_count - survivor_count)), passenger_count / (2 * survivor_count))
+
+formula_list <- list()
+prediction_rate_list <- list()
+formula_index <- 1
+
+for (num_vars in seq(length(candidate_vars))) {
+  vars_combos <- combn(candidate_vars, num_vars)
+  for (combo_idx in seq(ncol(vars_combos))) {
+    prediction_rate <- list()
+    for (fold_index in seq(num_folds)) {
+      df_train_split <- df_train_splits[[fold_index]]
+      df_train_split$Survived <- factor(df_train_split$Survived)  # without this line, randomForest() will perform regression instead of classification
+      df_val_split <- df_val_splits[[fold_index]]
+      formula <- as.formula(paste("Survived", paste(vars_combos[,combo_idx], collapse = " + "), sep = "~"))
+      model_random_forest <- randomForest(formula, data = df_train_split, importance = TRUE, classwt = class_weights)
+      predictions <- predict(model_random_forest, df_val_split, type = "class")
+      prediction_rate[[fold_index]] <- mean(predictions == df_val_split$Survived)
+    }
+    formula_list[[formula_index]] <- formula
+    prediction_rate_list[[formula_index]] <- mean(as.numeric(prediction_rate))
+    formula_index <- formula_index + 1
+  }
+}
+
+# Train on full training set and compute predictions for test set
+best_weighted_rf_formula <- formula_list[[which.max(unlist(prediction_rate_list))]]
+best_weighted_rf_prediction_rate <- max(unlist(prediction_rate_list))
+print(str_c("Best Weighted Random Forest prediction rate: ", best_weighted_rf_prediction_rate))
+
+best_model_weighted_rf <- randomForest(best_weighted_rf_formula, df_train_rf)
+weighted_rf_predictions <- as.numeric(as.logical(predict(best_model_weighted_rf, df_test)))
+```
+
+
+### Gradient boosting machine
+
+```{r}
+# Need to convert logicals to factors for gbm()
+logical_variables <- df_train %>% dplyr::select(all_of(candidate_vars)) %>% sapply(is.logical)
+logical_variables <- names(logical_variables[logical_variables])
+
+formula_list <- list()
+prediction_rate_list <- list()
+mean_threshold_list <- list()
+formula_index <- 1
+
+for (num_vars in seq(length(candidate_vars))) {
+  vars_combos <- combn(candidate_vars, num_vars)
+  for (combo_idx in seq(ncol(vars_combos))) {
+    prediction_rate <- list()
+    threshold_list <- list()
+    for (fold_index in seq(num_folds)) {
+      df_train_split <- df_train_splits[[fold_index]]
+      df_val_split <- df_val_splits[[fold_index]]
+      for (var in logical_variables) {
+        df_train_split[[var]] <- factor(df_train_split[[var]])
+        df_val_split[[var]] <- factor(df_val_split[[var]])
+      }
+      formula <- as.formula(paste("Survived", paste(vars_combos[,combo_idx], collapse = " + "), sep = "~"))
+      model_gbm <- gbm(formula, data = df_train_split, distribution = "bernoulli", n.trees = 100, interaction.depth = 3, shrinkage = 0.1)
+      probabilities <- predict(model_gbm, df_val_split, n.trees = seq(100), type = "response") %>% rowMeans()
+      roc_obj <- roc(df_val_split$Survived, probabilities, quiet = TRUE)
+      threshold <- coords(roc_obj, "best", "threshold", transpose = FALSE)$threshold
+      if (all(is.finite(threshold))) {
+        threshold_list[[fold_index]] <- threshold
+        predictions <- probabilities > threshold
+        prediction_rate[[fold_index]] <- mean(predictions == df_val_split$Survived)
+      } else {
+        threshold_list[[fold_index]] <- NA
+        prediction_rate[[fold_index]] <- NA
+      }
+    }
+    formula_list[[formula_index]] <- formula
+    prediction_rate_list[[formula_index]] <- mean(as.numeric(prediction_rate), na.rm = TRUE)
+    mean_threshold_list[[formula_index]] <- mean(as.numeric(threshold_list), na.rm = TRUE)
+    formula_index <- formula_index + 1
+  }
+}
+
+# Train on full training set and compute predictions for test set
+df_train_gbm <- df_train
+df_test_gbm <- df_test
+for (var in logical_variables) {
+  df_train_gbm[[var]] <- factor(df_train_gbm[[var]])
+  df_test_gbm[[var]] <- factor(df_test_gbm[[var]])
+}
+best_gbm_formula <- formula_list[[which.max(unlist(prediction_rate_list))]]
+best_gbm_prediction_rate <- max(unlist(prediction_rate_list), na.rm = TRUE)
+gbm_threshold <- mean_threshold_list[[which.max(unlist(prediction_rate_list))]]
+print(str_c("Best Gradient Boosting Machine prediction rate: ", best_gbm_prediction_rate))
+
+best_model_gbm <- gbm(best_gbm_formula, data = df_train_gbm, distribution = "bernoulli", n.trees = 100, interaction.depth = 3, shrinkage = 0.1)
+gbm_probabilities <- predict(best_model_gbm, df_test_gbm, n.trees = seq(100), type = "response") %>% rowMeans()
+gbm_predictions <- as.numeric(gbm_probabilities > gbm_threshold)
+```
+
+
+### Support vector machine with polynomial kernel
+
+```{r}
+# Remove Age, Cabin, Embarked, Fare from data because they contain NAs, and svm() omits predictions for rows with NAs
+vars_to_remove <- union(vars_with_NAs_test, vars_with_NAs_train)
+
+# Compute class weights for more balanced training
+passenger_count <- count(df_train)$n
+survivor_count <- df_train$Survived %>% as.numeric() %>% sum()
+class_weights <- c(passenger_count / (2 * (passenger_count - survivor_count)), passenger_count / (2 * survivor_count))
+names(class_weights) <- c("FALSE", "TRUE")
+
+formula_list <- list()
+prediction_rate_list <- list()
+formula_index <- 1
+
+for (num_vars in seq(length(candidate_vars))) {
+  vars_combos <- combn(candidate_vars, num_vars)
+  for (combo_idx in seq(ncol(vars_combos))) {
+    formula <- as.formula(paste("Survived", paste(vars_combos[,combo_idx], collapse = " + "), sep = "~"))
+    prediction_rate <- list()
+    for (fold_index in seq(num_folds)) {
+      # remove variables with NAs
+      df_train_split <- df_train_splits[[fold_index]] %>% dplyr::select(-one_of(vars_to_remove))  
+      df_val_split <- df_val_splits[[fold_index]] %>% dplyr::select(-one_of(vars_to_remove))
+      model_svm <- svm(formula, df_train_split, type = "C-classification", kernel = "polynomial", cost = 100, scale = FALSE, class.weights = class_weights)
+      predictions <- predict(model_svm, df_val_split)
+      prediction_rate[[fold_index]] <- mean(predictions == df_val_split$Survived)
+    }
+    formula_list[[formula_index]] <- formula
+    prediction_rate_list[[formula_index]] <- mean(as.numeric(prediction_rate), na.rm = TRUE)
+    formula_index <- formula_index + 1
+  }
+}
+
+# Train on full training set and compute predictions for test set
+best_svm_formula <- formula_list[[which.max(unlist(prediction_rate_list))]]
+best_svm_prediction_rate <- max(unlist(prediction_rate_list), na.rm = TRUE)
+print(str_c("Best Support Vector Machine prediction rate: ", best_svm_prediction_rate))
+
+df_train_svm <- df_train %>% dplyr::select(-one_of(vars_to_remove))
+df_test_svm <- df_test %>% dplyr::select(-one_of(vars_to_remove))
+best_model_svm <- svm(best_svm_formula, df_train_svm, type = "C-classification", kernel = "polynomial", cost = 100, scale = FALSE, class.weights = class_weights)
+svm_predictions <- as.numeric(as.logical(predict(best_model_svm, df_test_svm)))
+```
+
+
+### Linear discriminant analysis
+
+```{r}
+formula_list <- list()
+prediction_rate_list <- list()
+formula_index <- 1
+
+for (num_vars in seq(length(candidate_vars))) {
+  vars_combos <- combn(candidate_vars, num_vars)
+  for (combo_idx in seq(ncol(vars_combos))) {
+    formula <- as.formula(paste("Survived", paste(vars_combos[,combo_idx], collapse = " + "), sep = "~"))
+    prediction_rate <- list()
+    for (fold_index in seq(num_folds)) {
+      df_train_split <- df_train_splits[[fold_index]]
+      df_val_split <- df_val_splits[[fold_index]]
+      model_lda <- lda(formula, df_train_split)
+      predictions <- predict(model_lda, df_val_split)$class
+      prediction_rate[[fold_index]] <- mean(predictions == df_val_split$Survived)
+    }
+    formula_list[[formula_index]] <- formula
+    prediction_rate_list[[formula_index]] <- mean(as.numeric(prediction_rate), na.rm = TRUE)
+    formula_index <- formula_index + 1
+  }
+}
+
+# Train on full training set and compute predictions for test set
+best_lda_formula <- formula_list[[which.max(unlist(prediction_rate_list))]]
+best_lda_prediction_rate <- max(unlist(prediction_rate_list), na.rm = TRUE)
+print(str_c("Best Linear Discriminant Analysis prediction rate: ", best_lda_prediction_rate))
+
+best_model_lda <- lda(best_lda_formula, df_train)
+lda_predictions <- as.numeric(as.logical(predict(best_model_lda, df_test)$class))
+```
+
+
+### Naive Bayes
+
+```{r}
+formula_list <- list()
+prediction_rate_list <- list()
+formula_index <- 1
+
+for (num_vars in seq(length(candidate_vars))) {
+  vars_combos <- combn(candidate_vars, num_vars)
+  for (combo_idx in seq(ncol(vars_combos))) {
+    formula <- as.formula(paste("Survived", paste(vars_combos[,combo_idx], collapse = " + "), sep = "~"))
+    prediction_rate <- list()
+    for (fold_index in seq(num_folds)) {
+      df_train_split <- df_train_splits[[fold_index]]
+      df_val_split <- df_val_splits[[fold_index]]
+      model_nb <- naiveBayes(formula, df_train_split)
+      suppressWarnings(predictions <- predict(model_nb, df_val_split))  # there are some NA coercion warnings here
+      prediction_rate[[fold_index]] <- mean(predictions == df_val_split$Survived)
+    }
+    formula_list[[formula_index]] <- formula
+    prediction_rate_list[[formula_index]] <- mean(as.numeric(prediction_rate), na.rm = TRUE)
+    formula_index <- formula_index + 1
+  }
+}
+
+# Train on full training set and compute predictions for test set
+best_nb_formula <- formula_list[[which.max(unlist(prediction_rate_list))]]
+best_nb_prediction_rate <- max(unlist(prediction_rate_list), na.rm = TRUE)
+print(str_c("Best Naive Bayes prediction rate: ", best_nb_prediction_rate))
+
+best_model_nb <- naiveBayes(best_nb_formula, df_train)
+suppressWarnings(nb_predictions <- as.numeric(predict(best_model_nb, df_test)))
+```
+
+
+Here we print a summary of our best models for each algorithm together for convenience.
+
+```{r, results = "hold"}
+print(str_c("Best Generalized Linear Model prediction rate: ", best_glm_prediction_rate))
+print(str_c("Best K Nearest Neighbors prediction rate: ", best_knn_prediction_rate))
+print(str_c("Best Random Forest prediction rate: ", best_rf_prediction_rate))
+print(str_c("Best Weighted Random Forest prediction rate: ", best_weighted_rf_prediction_rate))
+print(str_c("Best Gradient Boosting Machine prediction rate: ", best_gbm_prediction_rate))
+print(str_c("Best Support Vector Machine prediction rate: ", best_svm_prediction_rate))
+print(str_c("Best Linear Discriminant Analysis prediction rate: ", best_lda_prediction_rate))
+print(str_c("Best Naive Bayes prediction rate: ", best_nb_prediction_rate))
+```
+
+## Submission file generation
+
+We stack our best models for each algorithm by simply taking the mode of their predictions.
+
+```{r}
+# Submission 1: Mode of all models' predictions
+final_predictions <- cbind(glm_predictions, knn_predictions, rf_predictions, weighted_rf_predictions, gbm_predictions, svm_predictions, lda_predictions, nb_predictions) %>% rowMeans() %>% round()
+submission1 <- tibble("PassengerId" = df_test$PassengerId, "Survived" = final_predictions)
+write_csv(submission1, "submission1.csv")
+
+# Submission 2: Mode of best 3 models
+final_predictions <- cbind(knn_predictions, gbm_predictions, svm_predictions) %>% rowMeans() %>% round()
+submission2 <- tibble("PassengerId" = df_test$PassengerId, "Survived" = final_predictions)
+write_csv(submission2, "submission2.csv")
+```
+
+Submitting these generated csv files to [Kaggle](https://www.kaggle.com/c/titanic) will produce public leaderboard scores of `0.78468` and `0.78947` respectively, the latter of which places us in the top 22%.
+
+## Final thoughts
+
+We've achieved a decent score, but there's clearly room for improvement. At this point it would be a good idea to perform exploratory data analysis again now that we've seen which variables our modeling algorithms found useful. We're better informed now. This may lead to ideas for new features, and we may also want to consider other modeling algorithms. It may also be a good idea to consider some of the variables we've ignored, like `Name`,`Embarked`, or numbers and letters in `Cabin`. There may exist patterns we haven't yet explored. We can perform several rounds of data exploration and modeling to improve our score. However, we should take care not to overfit the validation data (and hence the training data). Increasing the validation split from 20% to a higher percentage, applying stronger regularization to our models, or choosing modeling algorithms that are structured to exhibit higher bias and lower variance may help us fight overfitting.
